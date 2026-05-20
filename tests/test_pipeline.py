@@ -191,5 +191,277 @@ class TestPipelineParameters:
             run_pipeline_synthetic("INVALID", 100.0, 0.05)
 
 
+# ══════════════════════════════════════════════════════════════
+# 4. VOLUME CAPTURE (Enhancement 1, v1.3)
+# ══════════════════════════════════════════════════════════════
+
+class TestVolumeCapture:
+
+    @pytest.fixture(scope="class")
+    def result(self):
+        return run_pipeline_synthetic("SPY", 550.0, 0.05)
+
+    def test_volume_column_present(self, result):
+        """Volume column flows through to contracts DataFrame."""
+        assert "volume" in result["contracts"].columns
+
+    def test_volume_to_oi_ratio_present(self, result):
+        """volume_to_oi_ratio computed column flows through."""
+        assert "volume_to_oi_ratio" in result["contracts"].columns
+
+    def test_volume_nonnegative(self, result):
+        """Volume values are non-negative."""
+        assert (result["contracts"]["volume"] >= 0).all()
+
+    def test_volume_to_oi_ratio_consistent(self, result):
+        """volume_to_oi_ratio == volume / max(oi, 1) within tolerance."""
+        df = result["contracts"]
+        expected = df["volume"] / df["oi"].clip(lower=1)
+        np.testing.assert_allclose(df["volume_to_oi_ratio"].values, expected.values, rtol=1e-9)
+
+
+# ══════════════════════════════════════════════════════════════
+# 5. PUT-CALL PARITY SPOT INFERENCE (Enhancement 3, v1.3)
+# ══════════════════════════════════════════════════════════════
+
+class TestSpotInference:
+
+    def _build_synthetic_chain(self, S=550.0, r=0.05, q=0.013, dte=30,
+                                model="BSM"):
+        """Build a clean synthetic chain whose mid prices satisfy parity exactly."""
+        from datetime import date as d
+        from models import bsm_call_price, bsm_put_price, b76_call_price, b76_put_price
+        snapshot = d(2026, 4, 24)
+        expiry = pd.Timestamp(snapshot) + pd.Timedelta(days=dte)
+        T = dte / 365.0
+        sigma = 0.20
+
+        rows = []
+        for K in np.arange(S - 25, S + 26, 5.0):
+            if model == "BSM":
+                c = bsm_call_price(S, K, T, r, q, sigma)
+                p = bsm_put_price(S, K, T, r, q, sigma)
+            else:
+                c = b76_call_price(S, K, T, r, sigma)
+                p = b76_put_price(S, K, T, r, sigma)
+            for is_call, mid in [(True, float(c)), (False, float(p))]:
+                rows.append({
+                    "instrument_id": len(rows),
+                    "strike": float(K),
+                    "expiry": expiry,
+                    "is_call": is_call,
+                    "bid": max(mid * 0.99, 0.01),
+                    "ask": mid * 1.01,
+                    "mid_price": mid,
+                    "oi": 1000,
+                    "volume": 100,
+                    "volume_to_oi_ratio": 0.1,
+                })
+        return pd.DataFrame(rows), snapshot
+
+    def test_bsm_spot_recovered(self):
+        """BSM parity recovers spot within 0.1%."""
+        from pipeline import infer_underlying_price
+        S_true = 550.0
+        r, q = 0.05, 0.013
+        chain, snapshot = self._build_synthetic_chain(S=S_true, r=r, q=q, model="BSM")
+        S_inferred = infer_underlying_price(chain, snapshot, PRODUCTS["SPY"], r)
+        assert abs(S_inferred - S_true) / S_true < 0.001, \
+            f"Inferred {S_inferred} vs true {S_true}"
+
+    def test_black76_futures_recovered(self):
+        """Black-76 parity recovers futures price within 0.1%."""
+        from pipeline import infer_underlying_price
+        F_true = 2400.0
+        r = 0.05
+        chain, snapshot = self._build_synthetic_chain(S=F_true, r=r, model="BLACK76")
+        F_inferred = infer_underlying_price(chain, snapshot, PRODUCTS["GC"], r)
+        assert abs(F_inferred - F_true) / F_true < 0.001, \
+            f"Inferred {F_inferred} vs true {F_true}"
+
+    def test_no_pairs_raises(self):
+        """If no call/put pairs exist, ValueError is raised."""
+        from pipeline import infer_underlying_price
+        from datetime import date as d
+        snapshot = d(2026, 4, 24)
+        chain = pd.DataFrame({
+            "instrument_id": [0, 1],
+            "strike": [550.0, 555.0],
+            "expiry": [pd.Timestamp(snapshot) + pd.Timedelta(days=30)] * 2,
+            "is_call": [True, True],
+            "bid": [5.0, 4.0],
+            "ask": [5.5, 4.5],
+            "mid_price": [5.25, 4.25],
+            "oi": [1000, 1000],
+        })
+        with pytest.raises(ValueError):
+            infer_underlying_price(chain, snapshot, PRODUCTS["SPY"], 0.05)
+
+
+# ══════════════════════════════════════════════════════════════
+# 6. DATABENTO QUERY-WINDOW CLAMPING (T+0 publish-lag handling)
+# ══════════════════════════════════════════════════════════════
+
+class TestQueryWindowClamping:
+    """
+    Databento historical feeds lag real-time and don't fully materialize
+    until T+1, so a naive `start=today, end=tomorrow` query produces 422
+    errors. resolve_query_window inspects metadata.get_dataset_range and
+    (a) falls back to the most recent published date when today isn't
+    there yet, and (b) clamps every query end to the available high-water
+    mark.
+    """
+
+    def test_today_unpublished_falls_back(self):
+        """OPRA case: today not yet published → snapshot_date falls back."""
+        from datetime import date, datetime, timezone
+        from pipeline import resolve_query_window
+        # Today = Apr 28, but feed end is Apr 27 22:00 UTC.
+        avail_end = datetime(2026, 4, 27, 22, 0, tzinfo=timezone.utc)
+        w = resolve_query_window(
+            avail_end=avail_end,
+            dataset="OPRA.PILLAR",
+            snapshot_date=date(2026, 4, 28),
+            snapshot_time="15:55",
+            snapshot_window_seconds=1,
+        )
+        assert w["effective_date"] == date(2026, 4, 27)
+        # def_start should now be Apr 27, def_end clamped to avail_end.
+        assert w["def_start"] == "2026-04-27"
+        # The naive next_date "2026-04-28" would parse as Apr 28 00:00 UTC,
+        # which is past avail_end (Apr 27 22:00) — must be clamped.
+        assert pd.Timestamp(w["def_end"]) <= pd.Timestamp(avail_end)
+        # Quote window at 15:55 UTC on Apr 27 is well inside the available
+        # range; should not be clamped.
+        assert w["quote_start"].startswith("2026-04-27T15:55")
+        assert w["quote_end"].startswith("2026-04-27T15:55")
+
+    def test_avail_end_at_midnight_boundary_falls_back(self):
+        """
+        Edge case: avail_end is exactly midnight UTC of the requested date
+        (e.g. OPRA's daily-close summary record posted at 00:00:00 of T+1).
+        The requested calendar day contains no data inside its interior, so
+        we must still fall back to the previous trading day — not stay on
+        the requested date and produce a degenerate start==end query.
+        """
+        from datetime import date, datetime, timezone
+        from pipeline import resolve_query_window
+        avail_end = datetime(2026, 4, 28, 0, 0, tzinfo=timezone.utc)
+        w = resolve_query_window(
+            avail_end=avail_end,
+            dataset="OPRA.PILLAR",
+            snapshot_date=date(2026, 4, 28),
+            snapshot_time="15:55",
+            snapshot_window_seconds=1,
+        )
+        assert w["effective_date"] == date(2026, 4, 27)
+        assert w["def_start"] == "2026-04-27"
+        # def_end clamped to the boundary (Apr 28 00:00 UTC) — start < end.
+        de = pd.Timestamp(w["def_end"])
+        if de.tz is None:
+            de = de.tz_localize("UTC")
+        assert pd.Timestamp("2026-04-27", tz="UTC") < de
+
+    def test_today_published_date_kept_end_clamped(self):
+        """GLBX case: today partially published → keep date, clamp ends."""
+        from datetime import date, datetime, timezone
+        from pipeline import resolve_query_window
+        # Apr 28, available up to 19:00 UTC same day.
+        avail_end = datetime(2026, 4, 28, 19, 0, tzinfo=timezone.utc)
+        w = resolve_query_window(
+            avail_end=avail_end,
+            dataset="GLBX.MDP3",
+            snapshot_date=date(2026, 4, 28),
+            snapshot_time="15:55",
+            snapshot_window_seconds=1,
+        )
+        assert w["effective_date"] == date(2026, 4, 28)
+        # def_end would naively be Apr 29 00:00 — must clamp to avail_end.
+        assert pd.Timestamp(w["def_end"]) <= pd.Timestamp(avail_end)
+        assert pd.Timestamp(w["def_end"]) == pd.Timestamp(avail_end)
+        # GLBX stats window 00:00–02:00 fits inside available; not clamped.
+        assert w["stats_start"] == "2026-04-28T00:00"
+        assert w["stats_end"] == "2026-04-28T02:00"
+
+    def test_snapshot_time_past_avail_end_steps_back_to_previous_day(self):
+        """
+        If snapshot_time on today doesn't fit (e.g. tick fires at 11:55 ET
+        but the OPRA feed has only published through 09:30 ET so far), the
+        helper must step the date back to a fully-published trading day —
+        not slide the window into the empty pre-open seconds.
+        """
+        from datetime import date, datetime, timezone
+        from pipeline import resolve_query_window
+        # Apr 28 2026 is a Tuesday; Apr 27 is Monday (a trading day).
+        # Snapshot 15:55 UTC requested, but only 13:30 UTC published today.
+        avail_end = datetime(2026, 4, 28, 13, 30, tzinfo=timezone.utc)
+        w = resolve_query_window(
+            avail_end=avail_end,
+            dataset="OPRA.PILLAR",
+            snapshot_date=date(2026, 4, 28),
+            snapshot_time="15:55",
+            snapshot_window_seconds=1,
+        )
+        assert w["effective_date"] == date(2026, 4, 27)
+        # Quote window lands inside Apr 27 well within the published range.
+        assert w["quote_start"].startswith("2026-04-27T15:55")
+
+    def test_step_back_skips_weekends(self):
+        """Step-back walks past Sat/Sun to the previous Friday."""
+        from datetime import date, datetime, timezone
+        from pipeline import resolve_query_window
+        # Mon 2026-04-27, partial early-session publish; previous trading
+        # day is Fri 2026-04-24 (Sun Apr 26 and Sat Apr 25 are weekends).
+        avail_end = datetime(2026, 4, 27, 13, 30, tzinfo=timezone.utc)
+        w = resolve_query_window(
+            avail_end=avail_end,
+            dataset="OPRA.PILLAR",
+            snapshot_date=date(2026, 4, 27),
+            snapshot_time="15:55",
+            snapshot_window_seconds=1,
+        )
+        assert w["effective_date"] == date(2026, 4, 24)
+        assert date(2026, 4, 24).weekday() == 4  # Friday
+
+    def test_no_avail_end_passes_through(self):
+        """If metadata fetch fails (avail_end=None) we don't clamp anything."""
+        from datetime import date
+        from pipeline import resolve_query_window
+        w = resolve_query_window(
+            avail_end=None,
+            dataset="OPRA.PILLAR",
+            snapshot_date=date(2026, 4, 28),
+            snapshot_time="15:55",
+            snapshot_window_seconds=1,
+        )
+        assert w["effective_date"] == date(2026, 4, 28)
+        assert w["def_start"] == "2026-04-28"
+        assert w["def_end"] == "2026-04-29"
+
+    def test_get_dataset_available_end_parses_response(self):
+        """_get_dataset_available_end parses Databento's metadata reply."""
+        from unittest.mock import MagicMock
+        from pipeline import _get_dataset_available_end
+        client = MagicMock()
+        client.metadata.get_dataset_range.return_value = {
+            "start": "2013-04-01T00:00:00.000000000Z",
+            "end": "2026-04-27T22:00:00.000000000Z",
+        }
+        end = _get_dataset_available_end(client, "OPRA.PILLAR")
+        assert end is not None
+        assert end.year == 2026 and end.month == 4 and end.day == 27
+        assert end.hour == 22
+        # Returned datetime is UTC-aware.
+        assert end.tzinfo is not None
+
+    def test_get_dataset_available_end_swallows_errors(self):
+        """If the metadata call raises, helper returns None (no clamping)."""
+        from unittest.mock import MagicMock
+        from pipeline import _get_dataset_available_end
+        client = MagicMock()
+        client.metadata.get_dataset_range.side_effect = RuntimeError("network down")
+        assert _get_dataset_available_end(client, "OPRA.PILLAR") is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

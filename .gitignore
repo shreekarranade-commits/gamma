@@ -1,10 +1,37 @@
-venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-archive/
-*.log
+# Secrets — NEVER commit
+greek-scheduler.service
 .env
 .env.*
 !.env.example
+*.key
+secrets/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Generated data (large, regenerable, not source)
+archive/
+data/
+logs/
+*.log
+
+# IDE / OS junk
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
+
+# Local notes / scratch
+scratch/
+*.bak
+*.tmp

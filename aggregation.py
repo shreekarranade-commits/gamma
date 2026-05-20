@@ -141,6 +141,137 @@ def compute_expiry_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     return breakdown.sort_values(["strike", "expiry_bucket"])
 
 
+def interpret_scores(scores: dict) -> dict:
+    """
+    Translate raw GEX/VEX/CEX/GEX+ values into regime-aware subtitles
+    that consider all three Greeks together rather than each in isolation.
+
+    Returns
+    -------
+    dict with keys:
+      regime    — "STABILIZING" / "FRAGILE" / "DESTABILIZED" / "NEUTRAL"
+      gex       — subtitle line for the GEX card
+      vex       — subtitle line for the VEX card
+      cex       — subtitle line for the CEX card (prepends "OPEX: " when
+                  the nearest expiry is <= 2 DTE)
+      gex_plus  — subtitle line for the GEX+ card
+    """
+    gex = float(scores.get("gex", 0) or 0)
+    vex = float(scores.get("vex", 0) or 0)
+    cex = float(scores.get("cex", 0) or 0)
+    gex_plus = float(scores.get("gex_plus", 0) or 0)
+    min_dte = scores.get("min_dte")
+
+    # Reference magnitude for "near zero" / "large" judgements on $/pt scores.
+    # CEX uses a separate magnitude reference because it lives in $/day units.
+    ref = max(abs(gex), abs(vex), abs(gex_plus), 1.0)
+    cex_ref = max(abs(cex), 1.0)
+
+    def near_zero(v, r):
+        return abs(v) < 0.10 * r
+
+    def is_large(v, r):
+        return abs(v) > 0.50 * r
+
+    # ── GEX subtitle (joint with VEX) ─────────────────────────────
+    if near_zero(gex, ref):
+        gex_sub = "Neutral · No gamma pressure"
+    elif gex > 0 and vex > 0:
+        gex_sub = "Stabilizing · Dealers absorb moves"
+    elif gex > 0 and vex < 0:
+        gex_sub = "Stable but fragile · Vol spike risk"
+    elif gex < 0 and vex < 0:
+        gex_sub = "Destabilized · Moves amplified"
+    else:  # gex < 0 and vex >= 0
+        gex_sub = "Weak · Gamma negative, vanna supportive"
+
+    # ── VEX subtitle (joint with GEX) ─────────────────────────────
+    if vex > 0 and gex > 0:
+        vex_sub = "Vol spike = dealer buying · Protected"
+    elif vex < 0 and gex > 0:
+        vex_sub = "Vol spike = dealer selling · Liquidity cliff below"
+    elif vex < 0 and gex < 0:
+        vex_sub = "Crash-prone · Both channels destabilize"
+    elif vex > 0 and gex < 0:
+        vex_sub = "Vanna cushion · Partial protection"
+    else:
+        vex_sub = ""
+
+    # ── CEX subtitle (with OPEX prefix near expiry) ───────────────
+    if near_zero(cex, cex_ref):
+        cex_sub = "Minimal time decay pressure"
+    elif cex > 0:
+        cex_sub = "Sellers tomorrow · Downward drift into OPEX"
+    else:
+        cex_sub = "Buyers tomorrow · Upward drift into OPEX"
+    if min_dte is not None and min_dte <= 2:
+        cex_sub = f"OPEX: {cex_sub}"
+
+    # ── GEX+ subtitle ─────────────────────────────────────────────
+    if near_zero(gex_plus, ref):
+        gex_plus_sub = "Balanced · Options not driving price"
+    elif gex_plus > 0 and is_large(gex_plus, ref):
+        gex_plus_sub = "Strong liquidity · Range-bound likely"
+    elif gex_plus > 0:
+        gex_plus_sub = "Mild support · Normal conditions"
+    else:
+        gex_plus_sub = "Liquidity vacuum · Trend/crash risk"
+
+    # ── Overall regime ────────────────────────────────────────────
+    if near_zero(gex, ref) and near_zero(vex, ref):
+        regime = "NEUTRAL"
+    elif gex > 0 and vex > 0:
+        regime = "STABILIZING"
+    elif gex < 0 and vex < 0:
+        regime = "DESTABILIZED"
+    else:
+        regime = "FRAGILE"
+
+    return {
+        "regime": regime,
+        "gex": gex_sub,
+        "vex": vex_sub,
+        "cex": cex_sub,
+        "gex_plus": gex_plus_sub,
+    }
+
+
+def find_flip_strikes(profiles: pd.DataFrame, greek: str) -> list:
+    """
+    Detect strikes where a Greek's exposure crosses zero.
+
+    For each pair of adjacent strikes whose values have opposite signs,
+    interpolate linearly to estimate the zero-crossing strike:
+
+        flip = K_n + (K_{n+1} - K_n) * |v(K_n)| / (|v(K_n)| + |v(K_{n+1})|)
+
+    Returns a list of flip strikes (may be empty, one, or many).
+    """
+    if profiles is None or len(profiles) < 2 or greek not in profiles.columns:
+        return []
+
+    df = profiles.sort_values("strike").reset_index(drop=True)
+    strikes = df["strike"].astype(float).values
+    values = df[greek].astype(float).values
+
+    flips = []
+    for i in range(len(values) - 1):
+        v0, v1 = values[i], values[i + 1]
+        if not (np.isfinite(v0) and np.isfinite(v1)):
+            continue
+        # Skip exact zero anchors at i; treat strict opposite signs as a flip.
+        if v0 == 0 and v1 == 0:
+            continue
+        if v0 * v1 < 0:
+            denom = abs(v0) + abs(v1)
+            if denom == 0:
+                continue
+            k = strikes[i] + (strikes[i + 1] - strikes[i]) * abs(v0) / denom
+            flips.append(float(k))
+
+    return flips
+
+
 def build_all_outputs(
     df: pd.DataFrame,
     underlying_price: float,
@@ -159,7 +290,7 @@ def build_all_outputs(
     -------
     dict with keys:
       - contracts: DataFrame with per-contract exposures
-      - scores: dict with headline GEX/VEX/CEX/GEX+
+      - scores: dict with headline GEX/VEX/CEX/GEX+ and flip strikes
       - strike_profiles: DataFrame with per-strike aggregation
       - expiry_breakdown: DataFrame with per-strike-per-bucket aggregation
     """
@@ -167,6 +298,15 @@ def build_all_outputs(
     scores = compute_headline_scores(contracts)
     profiles = compute_strike_profiles(contracts)
     breakdown = compute_expiry_breakdown(contracts)
+
+    scores["gex_flip"] = find_flip_strikes(profiles, "gex")
+    scores["vex_flip"] = find_flip_strikes(profiles, "vex")
+    scores["cex_flip"] = find_flip_strikes(profiles, "cex")
+
+    if "dte" in contracts.columns and len(contracts) > 0:
+        scores["min_dte"] = int(contracts["dte"].min())
+    else:
+        scores["min_dte"] = None
 
     return {
         "contracts": contracts,

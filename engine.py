@@ -84,6 +84,61 @@ def cmd_synthetic(args):
     return result
 
 
+def cmd_run_all(args):
+    """Run the pipeline for every configured product."""
+    import os
+    if args.api_key:
+        os.environ["DATABENTO_API_KEY"] = args.api_key
+
+    from pipeline import run_all
+
+    snapshot = date.fromisoformat(args.date) if args.date else date.today()
+    out = run_all(
+        snapshot_date=snapshot,
+        risk_free_rate=args.rate,
+        snapshot_time=args.time,
+        archive=not args.no_archive,
+    )
+
+    print(f"\n{'=' * 68}")
+    print(f"  Multi-product run @ {snapshot}")
+    print(f"{'=' * 68}")
+    print(f"  {'SYM':<5} {'OK':<3} {'UNDERLY':>10}  {'GEX':>14} {'VEX':>14} {'CEX':>12}")
+    print(f"  {'-' * 64}")
+    for row in out["summary"]:
+        if row["ok"]:
+            print(
+                f"  {row['symbol']:<5} {'✓':<3} {row['underlying']:>10.2f}  "
+                f"{row['gex']:>14,.0f} {row['vex']:>14,.0f} {row['cex']:>12,.0f}"
+            )
+        else:
+            print(f"  {row['symbol']:<5} {'✗':<3}  {row.get('error', 'unknown error')}")
+    print(f"{'=' * 68}")
+    return out
+
+
+def cmd_backfill(args):
+    """Backfill historical trading days for a product."""
+    import os
+    if args.api_key:
+        os.environ["DATABENTO_API_KEY"] = args.api_key
+
+    from backfill import run_backfill
+
+    start = date.fromisoformat(args.start)
+    end = date.fromisoformat(args.end) if args.end else date.today()
+    summary = run_backfill(
+        product=args.product,
+        start=start,
+        end=end,
+        rate=args.rate,
+        delay=args.delay,
+        snapshot_time=args.time,
+        dry_run=args.dry_run,
+    )
+    return summary
+
+
 def cmd_purge(args):
     """Purge archived data."""
     from archive import purge
@@ -144,9 +199,30 @@ def main():
     p_run.add_argument("underlying", type=float, help="Current underlying price")
     p_run.add_argument("--date", help="Snapshot date (YYYY-MM-DD, default: today)")
     p_run.add_argument("--rate", type=float, default=0.05, help="Risk-free rate (default: 0.05)")
-    p_run.add_argument("--time", default="15:45", help="Snapshot time HH:MM (default: 15:45)")
+    p_run.add_argument("--time", default="15:55", help="Snapshot time HH:MM (default: 15:55)")
     p_run.add_argument("--api-key", help="Databento API key (or set DATABENTO_API_KEY env var)")
     p_run.add_argument("--no-archive", action="store_true", help="Skip archiving results")
+
+    # ── run-all ──
+    p_all = sub.add_parser("run-all", help="Run pipeline for every configured product")
+    p_all.add_argument("--date", help="Snapshot date (YYYY-MM-DD, default: today)")
+    p_all.add_argument("--rate", type=float, default=0.05, help="Risk-free rate (default: 0.05)")
+    p_all.add_argument("--time", default="15:55", help="Snapshot time HH:MM (default: 15:55)")
+    p_all.add_argument("--api-key", help="Databento API key (or set DATABENTO_API_KEY env var)")
+    p_all.add_argument("--no-archive", action="store_true", help="Skip archiving results")
+
+    # ── backfill ──
+    p_bf = sub.add_parser("backfill", help="Historical backfill across trading days")
+    p_bf.add_argument("--product", default="SPY", choices=list(PRODUCTS.keys()))
+    p_bf.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
+    p_bf.add_argument("--end", help="End date YYYY-MM-DD (default: today)")
+    p_bf.add_argument("--rate", type=float, default=0.05)
+    p_bf.add_argument("--delay", type=float, default=2.0,
+                      help="Seconds between days (default: 2)")
+    p_bf.add_argument("--time", default="15:55", help="Snapshot time HH:MM (default: 15:55)")
+    p_bf.add_argument("--api-key", help="Databento API key (or set DATABENTO_API_KEY env var)")
+    p_bf.add_argument("--dry-run", action="store_true",
+                      help="List dates to process without calling the API")
 
     # ── synthetic ──
     p_syn = sub.add_parser("synthetic", help="Run with synthetic data (no API key)")
@@ -184,6 +260,8 @@ def main():
 
     commands = {
         "run": cmd_run,
+        "run-all": cmd_run_all,
+        "backfill": cmd_backfill,
         "synthetic": cmd_synthetic,
         "purge": cmd_purge,
         "serve": cmd_serve,

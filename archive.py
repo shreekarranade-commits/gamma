@@ -65,7 +65,8 @@ def archive_results(pipeline_result: dict, config: ArchiveConfig = ARCHIVE_DEFAU
     if len(contracts_df) > 0:
         greeks = contracts_df[
             [c for c in contracts_df.columns
-             if c in ["strike", "expiry", "is_call", "dte", "oi", "iv",
+             if c in ["strike", "expiry", "is_call", "dte", "oi", "volume",
+                       "volume_to_oi_ratio", "iv",
                        "delta", "gamma", "vanna", "charm", "gex", "vex", "cex"]]
         ].copy()
         if "expiry" in greeks.columns:
@@ -159,6 +160,48 @@ def load_raw_chain(product: str, snapshot_date: date, config: ArchiveConfig = AR
 # ══════════════════════════════════════════════════════════════
 # AVAILABLE DATES
 # ══════════════════════════════════════════════════════════════
+
+def load_score_history(product: str, config: ArchiveConfig = ARCHIVE_DEFAULTS) -> pd.DataFrame:
+    """
+    Iterate every archived date for a product and load scores.json plus the
+    underlying price from metadata.json.
+
+    Returns a DataFrame with columns:
+        date, gex, vex, cex, gex_plus, underlying_price,
+        gex_flip, vex_flip, cex_flip
+    Sorted ascending by date. Empty DataFrame if no archives exist.
+    """
+    rows = []
+    for d in list_archived_dates(product, config):
+        try:
+            scores = load_scores(product, d, config)
+        except FileNotFoundError:
+            continue
+        try:
+            meta = load_metadata(product, d, config)
+            underlying = meta.get("underlying_price")
+        except FileNotFoundError:
+            underlying = None
+
+        rows.append({
+            "date": d,
+            "gex": float(scores.get("gex", 0)),
+            "vex": float(scores.get("vex", 0)),
+            "cex": float(scores.get("cex", 0)),
+            "gex_plus": float(scores.get("gex_plus", 0)),
+            "underlying_price": underlying,
+            "gex_flip": scores.get("gex_flip") or [],
+            "vex_flip": scores.get("vex_flip") or [],
+            "cex_flip": scores.get("cex_flip") or [],
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "date", "gex", "vex", "cex", "gex_plus", "underlying_price",
+            "gex_flip", "vex_flip", "cex_flip",
+        ])
+    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
 
 def list_archived_dates(product: str, config: ArchiveConfig = ARCHIVE_DEFAULTS) -> list[date]:
     """List all archived dates for a product, sorted ascending."""

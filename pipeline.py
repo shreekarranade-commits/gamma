@@ -4,6 +4,7 @@ Data pipeline: ingest → join → filter → IV solve → Greeks → aggregate.
 Handles both OPRA.PILLAR (equities) and GLBX.MDP3 (futures) datasets.
 """
 
+import math
 import time
 import logging
 from datetime import datetime, date, timedelta, timezone
@@ -28,6 +29,83 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════
+# UNDERLYING PRICE INFERENCE (Put-Call Parity)
+# ══════════════════════════════════════════════════════════════
+
+def infer_underlying_price(
+    chain: pd.DataFrame,
+    snapshot_date: date,
+    product: ProductConfig,
+    risk_free_rate: float,
+) -> float:
+    """
+    Infer the underlying spot/futures price from the option chain via put-call parity.
+
+    For BSM products: forward F = K* + C(K*) - P(K*) at the ATM strike K*
+    where |C - P| is minimal on the nearest expiry. Spot S = F · exp(-(r-q)·T).
+
+    For Black-76 products: futures F = K* + (C - P) · exp(r·T) at ATM of nearest
+    expiry that has matched call/put pairs.
+
+    Raises ValueError if no call/put pair can be found.
+    """
+    df = chain.copy()
+    if "bid" in df.columns and "ask" in df.columns:
+        df = df[(df["bid"] > 0) & (df["ask"] > 0)]
+    if "expiry" not in df.columns:
+        raise ValueError("Chain has no 'expiry' column for parity inference")
+
+    df = df.copy()
+    df["dte"] = (df["expiry"] - pd.Timestamp(snapshot_date)).dt.days
+    df = df[df["dte"] >= 1]
+    if df.empty:
+        raise ValueError("No contracts with DTE >= 1 for parity inference")
+
+    q = product.dividend_yield if product.dividend_yield is not None else 0.0
+    r = risk_free_rate
+    is_bsm = product.pricing_model == PricingModel.BSM
+
+    for dte_val in sorted(df["dte"].unique()):
+        rows = df[df["dte"] == dte_val]
+        calls = rows[rows["is_call"]][["strike", "mid_price"]].rename(
+            columns={"mid_price": "call_mid"}
+        )
+        puts = rows[~rows["is_call"]][["strike", "mid_price"]].rename(
+            columns={"mid_price": "put_mid"}
+        )
+        paired = calls.merge(puts, on="strike")
+        if paired.empty:
+            continue
+
+        paired["diff"] = (paired["call_mid"] - paired["put_mid"]).abs()
+        atm = paired.loc[paired["diff"].idxmin()]
+        K_star = float(atm["strike"])
+        C = float(atm["call_mid"])
+        P = float(atm["put_mid"])
+        T = dte_val / 365.0
+
+        if is_bsm:
+            F = K_star + C - P
+            S = F * math.exp(-(r - q) * T)
+            logger.info(
+                f"  Parity (BSM): K*={K_star:.2f}, C={C:.3f}, P={P:.3f}, "
+                f"T={T:.4f}y → F={F:.3f}, S≈{S:.3f}"
+            )
+            return float(S)
+        else:
+            F = K_star + (C - P) * math.exp(r * T)
+            logger.info(
+                f"  Parity (Black-76): K*={K_star:.2f}, C={C:.3f}, P={P:.3f}, "
+                f"T={T:.4f}y → F={F:.3f}"
+            )
+            return float(F)
+
+    raise ValueError(
+        f"Cannot infer underlying for {product.symbol}: no call/put pairs on any expiry"
+    )
+
+
+# ══════════════════════════════════════════════════════════════
 # DATA INGESTION
 # ══════════════════════════════════════════════════════════════
 
@@ -41,11 +119,158 @@ def _build_client():
     return db.Historical(get_databento_key())
 
 
+# ── Dataset-range resolution ─────────────────────────────────
+# Databento historical feeds lag real-time and don't fully materialize
+# until T+1. The scheduler builds query windows from "today" without
+# checking what's actually published, which produces 422 errors of the
+# form `data_start_after_available_end` (today not yet there) or
+# `data_end_after_available_end` (today partially there, but the
+# day-after end we asked for is past the feed's high-water mark).
+# These helpers query metadata.get_dataset_range to learn the real
+# window and clamp queries — falling back to the most recent published
+# day for the snapshot when today isn't there yet.
+
+def _get_dataset_available_end(client, dataset: str) -> Optional[datetime]:
+    """
+    Query Databento for the high-water-mark of published data on `dataset`.
+    Returns a UTC-aware datetime, or None if metadata cannot be fetched.
+    """
+    try:
+        rng = client.metadata.get_dataset_range(dataset=dataset)
+    except Exception as e:
+        logger.warning(f"  get_dataset_range failed for {dataset}: {e}; skipping clamp")
+        return None
+    end_str = rng.get("end") or rng.get("end_date")
+    if not end_str:
+        return None
+    ts = pd.Timestamp(end_str)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.to_pydatetime()
+
+
+def _to_utc(ts_str: str) -> pd.Timestamp:
+    """Treat naive timestamps as UTC; convert tz-aware ones to UTC."""
+    ts = pd.Timestamp(ts_str)
+    if ts.tz is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def resolve_query_window(
+    avail_end: Optional[datetime],
+    dataset: str,
+    snapshot_date: date,
+    snapshot_time: str,
+    snapshot_window_seconds: int,
+) -> dict:
+    """
+    Build per-query start/end timestamps that fit inside the dataset's
+    available range.
+
+    1. If snapshot_date is past avail_end's date, fall back to that date —
+       the previous publishing day will have a complete OI/quotes window.
+    2. Build defs/quotes/stats windows on the effective date as before.
+    3. Clamp every end timestamp to min(query_end, avail_end).
+    4. If snapshot_time itself is past avail_end on the effective date,
+       slide the quote window back so it ends at avail_end.
+
+    `avail_end` may be None (metadata fetch failed) — in that case we
+    return the unclamped windows and let Databento raise as before.
+    """
+    # Choose the most recent date on which the requested snapshot window
+    # fully fits inside the dataset's published range, skipping weekends.
+    # This handles three cases:
+    #  - today not yet published     → step back to most recent data day
+    #  - today partially published   → step back if snapshot_time isn't
+    #                                  yet covered (avoids querying the
+    #                                  exact 09:30 ET boundary, which has
+    #                                  no quotes flowing yet)
+    #  - holidays                    → ride on Databento's own avail_end,
+    #                                  which already excludes them
+    effective = snapshot_date
+    if avail_end is not None:
+        hour, minute = (int(x) for x in snapshot_time.split(":"))
+        most_recent_data_date = (avail_end - timedelta(seconds=1)).date()
+        candidate = min(snapshot_date, most_recent_data_date)
+        for _ in range(8):
+            snap_start = datetime(
+                candidate.year, candidate.month, candidate.day,
+                hour, minute, tzinfo=timezone.utc,
+            )
+            snap_end = snap_start + timedelta(seconds=snapshot_window_seconds)
+            if snap_end <= avail_end and candidate.weekday() < 5:
+                break
+            candidate = candidate - timedelta(days=1)
+        if candidate != snapshot_date:
+            logger.warning(
+                f"  {dataset}: requested {snapshot_date} snapshot window doesn't "
+                f"fit (avail_end={avail_end.isoformat()}); falling back to {candidate}"
+            )
+        effective = candidate
+
+    date_str = effective.isoformat()
+    next_date_str = (effective + timedelta(days=1)).isoformat()
+
+    def_start = date_str
+    def_end = next_date_str
+
+    quote_start_dt = datetime.strptime(f"{date_str}T{snapshot_time}", "%Y-%m-%dT%H:%M")
+    quote_end_dt = quote_start_dt + timedelta(seconds=snapshot_window_seconds)
+    quote_start = quote_start_dt.isoformat()
+    quote_end = quote_end_dt.isoformat()
+
+    if dataset == "OPRA.PILLAR":
+        stats_start = f"{date_str}T09:30"
+        stats_end = f"{date_str}T12:00"
+    elif dataset == "GLBX.MDP3":
+        stats_start = f"{date_str}T00:00"
+        stats_end = f"{date_str}T02:00"
+    else:
+        stats_start = date_str
+        stats_end = next_date_str
+
+    if avail_end is not None:
+        avail_end_ts = pd.Timestamp(avail_end).tz_convert("UTC")
+        avail_end_iso = avail_end_ts.isoformat()
+
+        def clamp_end(end_str_local: str) -> str:
+            return avail_end_iso if _to_utc(end_str_local) > avail_end_ts else end_str_local
+
+        def_end = clamp_end(def_end)
+        stats_end = clamp_end(stats_end)
+        quote_end = clamp_end(quote_end)
+
+        # If the quote window's start itself is past avail_end (e.g. tick
+        # fired at 16:00 ET but the feed only has 15:50 ET), slide back.
+        if _to_utc(quote_start) > avail_end_ts:
+            slide_end = avail_end_ts
+            slide_start = slide_end - pd.Timedelta(seconds=snapshot_window_seconds)
+            logger.warning(
+                f"  {dataset}: snapshot_time {snapshot_time} on {date_str} is past "
+                f"available end {avail_end_iso}; sliding quote window back."
+            )
+            quote_start = slide_start.isoformat()
+            quote_end = slide_end.isoformat()
+
+    return {
+        "effective_date": effective,
+        "def_start": def_start,
+        "def_end": def_end,
+        "quote_start": quote_start,
+        "quote_end": quote_end,
+        "stats_start": stats_start,
+        "stats_end": stats_end,
+    }
+
+
 def ingest_chain(
     product: ProductConfig,
     snapshot_date: date,
-    snapshot_time: str = "15:45",
-    snapshot_window_minutes: int = 15,
+    snapshot_time: str = "15:55",
+    snapshot_window_seconds: int = 1,
 ) -> dict:
     """
     Pull raw option chain data from Databento.
@@ -54,73 +279,85 @@ def ingest_chain(
     ----------
     product : ProductConfig
     snapshot_date : date
-    snapshot_time : str - HH:MM for quote snapshot start (UTC naive, as Databento expects)
-    snapshot_window_minutes : int - quote window length; we take the last quote
-        per instrument from within this window
+    snapshot_time : str - HH:MM for quote snapshot start (UTC naive, as
+        Databento expects)
+    snapshot_window_seconds : int - quote window length in seconds. Pulls the
+        consolidated top-of-book snapshot schema (cmbp-1 for OPRA, mbp-1 for
+        GLBX) over a tight window and takes the last quote per instrument.
+
+    The query window is clamped to the dataset's actually-available range
+    via metadata.get_dataset_range; if the requested date is past the
+    feed's high-water mark we fall back to the most recent published day
+    so the scheduler still produces output during the T+0 publish lag.
 
     Returns
     -------
-    dict with keys: definitions, quotes, stats (all DataFrames)
+    dict with keys: definitions, quotes, stats (all DataFrames),
+    plus effective_date (the date actually queried after fallback).
     """
     client = _build_client()
     ds = product.dataset
     sym = product.parent_symbol
-    date_str = snapshot_date.isoformat()
-    next_date = (snapshot_date + timedelta(days=1)).isoformat()
+
+    avail_end = _get_dataset_available_end(client, ds)
+    window = resolve_query_window(
+        avail_end, ds, snapshot_date, snapshot_time, snapshot_window_seconds
+    )
+    effective_date = window["effective_date"]
+    date_str = effective_date.isoformat()
 
     logger.info(f"Ingesting {product.symbol} chain for {date_str} from {ds}")
+    if avail_end is not None:
+        logger.info(f"  Dataset {ds} available_end={avail_end.isoformat()}")
+    if effective_date != snapshot_date:
+        logger.info(f"  Effective date adjusted from {snapshot_date} → {effective_date}")
 
     # 1. Instrument definitions
-    logger.info("  Pulling definitions...")
+    logger.info(f"  Pulling definitions ({window['def_start']} → {window['def_end']})...")
     defs_data = client.timeseries.get_range(
         dataset=ds,
         schema="definition",
         symbols=[sym],
         stype_in="parent",
-        start=date_str,
-        end=next_date,
+        start=window["def_start"],
+        end=window["def_end"],
     )
     defs_df = defs_data.to_df()
 
-    # 2. Top-of-book quotes (bounded window)
-    start_dt = datetime.strptime(f"{date_str}T{snapshot_time}", "%Y-%m-%dT%H:%M")
-    end_dt = start_dt + timedelta(minutes=snapshot_window_minutes)
-    start_ts = start_dt.isoformat()
-    end_ts = end_dt.isoformat()
-    logger.info(f"  Pulling quotes ({start_ts} to {end_ts})...")
-    # 1-minute aggregated BBO: keeps the stream well under the 5 GB limit
-    # and is the right granularity for an EOD snapshot.
-    quotes_schema = "cbbo-1m" if ds == "OPRA.PILLAR" else "bbo-1m"
+    # 2. Top-of-book quote snapshot.
+    # Use the consolidated MBP-1 schema (cmbp-1 on OPRA, mbp-1 on GLBX) over
+    # a tight window — typically 1 second — at the snapshot time. We take the
+    # last update per instrument from within the window in build_chain_dataframe.
+    # This pulls dramatically less data than the cbbo-1m bar schema and avoids
+    # the gateway timeouts that came with multi-minute aggregated bar pulls.
+    quotes_schema = "cmbp-1" if ds == "OPRA.PILLAR" else "mbp-1"
+    logger.info(
+        f"  Pulling quote snapshot via {quotes_schema} "
+        f"({window['quote_start']} → {window['quote_end']})..."
+    )
     quotes_data = client.timeseries.get_range(
         dataset=ds,
         schema=quotes_schema,
         symbols=[sym],
         stype_in="parent",
-        start=start_ts,
-        end=end_ts,
+        start=window["quote_start"],
+        end=window["quote_end"],
     )
     quotes_df = quotes_data.to_df()
 
     # 3. Daily statistics (open interest)
     # OI lands in a short burst once per day; pulling the full 24h is millions
     # of non-OI rows. Use a narrow per-dataset window around the known publish time.
-    if ds == "OPRA.PILLAR":
-        stats_start = f"{date_str}T09:30"
-        stats_end = f"{date_str}T12:00"
-    elif ds == "GLBX.MDP3":
-        stats_start = f"{date_str}T00:00"
-        stats_end = f"{date_str}T02:00"
-    else:
-        stats_start = date_str
-        stats_end = next_date
-    logger.info(f"  Pulling statistics (OI) from {stats_start} to {stats_end}...")
+    logger.info(
+        f"  Pulling statistics (OI) from {window['stats_start']} to {window['stats_end']}..."
+    )
     stats_data = client.timeseries.get_range(
         dataset=ds,
         schema="statistics",
         symbols=[sym],
         stype_in="parent",
-        start=stats_start,
-        end=stats_end,
+        start=window["stats_start"],
+        end=window["stats_end"],
     )
     stats_df = stats_data.to_df()
 
@@ -128,6 +365,7 @@ def ingest_chain(
         "definitions": defs_df,
         "quotes": quotes_df,
         "stats": stats_df,
+        "effective_date": effective_date,
     }
 
 
@@ -168,8 +406,13 @@ def build_chain_dataframe(raw: dict, product: ProductConfig) -> pd.DataFrame:
     quotes_last["mid_price"] = (quotes_last["bid"] + quotes_last["ask"]) / 2
 
     # ── Parse stats ──
-    # stat_type == 9 is OPEN_INTEREST on OPRA.PILLAR / GLBX.MDP3.
+    # stat_type == 9  is OPEN_INTEREST and stat_type == 6 is CLEARED_VOLUME
+    # on both OPRA.PILLAR and GLBX.MDP3.
     # Quantity of 2147483647 (INT32_MAX) is the unset sentinel — drop those.
+    if "stat_type" in stats.columns:
+        avail_types = sorted(stats["stat_type"].dropna().unique().tolist())
+        logger.info(f"  Stats stat_types available: {avail_types}")
+
     oi_stats = stats[stats["stat_type"] == 9].copy()
     if len(oi_stats) == 0:
         logger.warning("  No OI rows (stat_type=9) found; OI will default to 0.")
@@ -181,10 +424,25 @@ def build_chain_dataframe(raw: dict, product: ProductConfig) -> pd.DataFrame:
     oi_last.columns = ["instrument_id", "oi"]
     oi_last["oi"] = oi_last["oi"].astype(float)
 
+    # Volume: stat_type == 6 is CLEARED_VOLUME (daily traded volume per contract)
+    vol_stats = stats[stats["stat_type"] == 6].copy()
+    if len(vol_stats) == 0:
+        logger.info("  No volume rows (stat_type=6) found; volume will default to 0.")
+        vol_last = pd.DataFrame(columns=["instrument_id", "volume"])
+    else:
+        vol_stats = vol_stats[vol_stats["quantity"] < 2_147_483_647]
+        vol_last = vol_stats.sort_values("ts_event").groupby("instrument_id").last()
+        vol_last = vol_last[["quantity"]].reset_index()
+        vol_last.columns = ["instrument_id", "volume"]
+        vol_last["volume"] = vol_last["volume"].astype(float)
+
     # ── Join ──
     chain = def_parsed.merge(quotes_last, on="instrument_id", how="inner")
     chain = chain.merge(oi_last, on="instrument_id", how="left")
+    chain = chain.merge(vol_last, on="instrument_id", how="left")
     chain["oi"] = chain["oi"].fillna(0).astype(int)
+    chain["volume"] = chain["volume"].fillna(0).astype(int)
+    chain["volume_to_oi_ratio"] = chain["volume"] / chain["oi"].clip(lower=1)
 
     logger.info(f"  Chain built: {len(chain)} contracts")
     return chain
@@ -338,9 +596,9 @@ def solve_and_compute(
 def run_pipeline(
     symbol: str,
     snapshot_date: date,
-    underlying_price: float,
+    underlying_price: Optional[float] = None,
     risk_free_rate: float = 0.05,
-    snapshot_time: str = "15:45",
+    snapshot_time: str = "15:55",
     filters: FilterConfig = FILTER_DEFAULTS,
 ) -> dict:
     """
@@ -387,8 +645,24 @@ def run_pipeline(
     # 2. Ingest
     raw = ingest_chain(product, snapshot_date, snapshot_time)
 
+    # If the dataset's published range didn't include the requested date,
+    # ingest_chain falls back to the most recent published day. Use that
+    # date downstream so DTE, parity inference, and archive metadata all
+    # reflect the data actually queried.
+    effective_date = raw.get("effective_date", snapshot_date)
+    if effective_date != snapshot_date:
+        logger.info(f"  run_pipeline using effective snapshot_date={effective_date}")
+        snapshot_date = effective_date
+
     # 3. Build chain
     chain = build_chain_dataframe(raw, product)
+
+    # 3b. Infer underlying price if not provided
+    if underlying_price is None:
+        underlying_price = infer_underlying_price(
+            chain, snapshot_date, product, risk_free_rate
+        )
+        logger.info(f"  Inferred underlying for {symbol}: {underlying_price:.3f}")
 
     # 4. Filter
     filtered, filter_log = filter_chain(chain, underlying_price, snapshot_date, filters)
@@ -446,6 +720,83 @@ def run_pipeline(
 
 
 # ══════════════════════════════════════════════════════════════
+# MULTI-PRODUCT RUN
+# ══════════════════════════════════════════════════════════════
+
+def run_all(
+    snapshot_date: Optional[date] = None,
+    risk_free_rate: float = 0.05,
+    snapshot_time: str = "15:55",
+    archive: bool = True,
+) -> dict:
+    """
+    Run the full pipeline for every configured product in sequence.
+
+    Each product's underlying price is auto-inferred via put-call parity.
+    Failures on one product do not abort the run; the error is logged and the
+    next product is attempted.
+
+    Returns
+    -------
+    dict with:
+      - results: per-symbol dict of pipeline output (or None on failure)
+      - errors: per-symbol error string (or None on success)
+      - summary: list of {symbol, ok, gex, vex, cex, gex_plus, underlying}
+    """
+    from archive import archive_results
+
+    if snapshot_date is None:
+        snapshot_date = date.today()
+
+    results = {}
+    errors = {}
+    summary = []
+
+    for symbol in PRODUCTS.keys():
+        t0 = time.time()
+        try:
+            logger.info(f"\n=== run_all: {symbol} ===")
+            res = run_pipeline(
+                symbol=symbol,
+                snapshot_date=snapshot_date,
+                underlying_price=None,
+                risk_free_rate=risk_free_rate,
+                snapshot_time=snapshot_time,
+            )
+            results[symbol] = res
+            errors[symbol] = None
+
+            if archive:
+                try:
+                    archive_results(res)
+                except Exception as ae:
+                    logger.error(f"  archive_results failed for {symbol}: {ae}")
+
+            summary.append({
+                "symbol": symbol,
+                "ok": True,
+                "underlying": res["underlying_price"],
+                "gex": res["scores"]["gex"],
+                "vex": res["scores"]["vex"],
+                "cex": res["scores"]["cex"],
+                "gex_plus": res["scores"]["gex_plus"],
+                "duration_s": round(time.time() - t0, 2),
+            })
+        except Exception as e:
+            logger.error(f"  {symbol} failed: {type(e).__name__}: {e}")
+            results[symbol] = None
+            errors[symbol] = f"{type(e).__name__}: {e}"
+            summary.append({
+                "symbol": symbol,
+                "ok": False,
+                "error": errors[symbol],
+                "duration_s": round(time.time() - t0, 2),
+            })
+
+    return {"results": results, "errors": errors, "summary": summary}
+
+
+# ══════════════════════════════════════════════════════════════
 # PIPELINE WITH SYNTHETIC DATA (for testing without Databento)
 # ══════════════════════════════════════════════════════════════
 
@@ -493,6 +844,7 @@ def run_pipeline_synthetic(
                 oi = max(10, int(5000 * np.exp(-0.5 * ((K - S) / (S * 0.05))**2)))
                 oi += np.random.randint(0, 500)
 
+                volume = max(0, int(oi * np.random.uniform(0.05, 0.3)))
                 rows.append({
                     "instrument_id": len(rows),
                     "strike": K,
@@ -502,6 +854,8 @@ def run_pipeline_synthetic(
                     "ask": price * 1.05,
                     "mid_price": price,
                     "oi": oi,
+                    "volume": volume,
+                    "volume_to_oi_ratio": volume / max(oi, 1),
                     "dte": dte,
                 })
 

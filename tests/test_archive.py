@@ -19,7 +19,7 @@ from archive import (
     archive_results, load_scores, load_metadata, load_strike_profiles,
     load_expiry_breakdown, load_contracts, load_raw_chain,
     list_archived_products, list_archived_dates, get_archive_availability,
-    purge, get_archive_path,
+    purge, get_archive_path, load_score_history,
 )
 from config import ArchiveConfig
 from pipeline import run_pipeline_synthetic
@@ -263,6 +263,64 @@ class TestPurge:
 
         avail = get_archive_availability("SPY", r["snapshot_date"], tmp_archive)
         assert avail["tier1"] is True  # Not purged (today >= yesterday)
+
+
+# ══════════════════════════════════════════════════════════════
+# SCORE HISTORY (Enhancement 7, v1.3)
+# ══════════════════════════════════════════════════════════════
+
+class TestScoreHistory:
+
+    def _stamp_archive(self, tmp_archive, product, snapshot_date,
+                        underlying, gex, vex, cex):
+        """Hand-craft a minimal archive entry to control date and values."""
+        from archive import get_archive_path
+        d = get_archive_path(product, snapshot_date, tmp_archive)
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "scores.json", "w") as f:
+            json.dump({
+                "gex": gex, "vex": vex, "cex": cex, "gex_plus": gex + vex,
+                "gex_flip": [550.0], "vex_flip": [], "cex_flip": [],
+            }, f)
+        with open(d / "metadata.json", "w") as f:
+            json.dump({
+                "product": product, "underlying_price": underlying,
+                "engine_version": "1.3",
+            }, f)
+
+    def test_empty_when_no_archive(self, tmp_archive):
+        df = load_score_history("SPY", config=tmp_archive)
+        assert df.empty
+        assert list(df.columns) == [
+            "date", "gex", "vex", "cex", "gex_plus", "underlying_price",
+            "gex_flip", "vex_flip", "cex_flip",
+        ]
+
+    def test_loads_multiple_dates_sorted(self, tmp_archive):
+        from datetime import date as d
+        # Stamp three out-of-order dates.
+        self._stamp_archive(tmp_archive, "SPY", d(2026, 4, 22), 549.0, 100.0, -50.0, 5.0)
+        self._stamp_archive(tmp_archive, "SPY", d(2026, 4, 24), 552.0, 200.0, -80.0, 7.0)
+        self._stamp_archive(tmp_archive, "SPY", d(2026, 4, 23), 551.0, 150.0, -60.0, 6.0)
+
+        df = load_score_history("SPY", config=tmp_archive)
+        assert len(df) == 3
+        # Sorted ascending by date.
+        assert list(df["date"]) == [d(2026, 4, 22), d(2026, 4, 23), d(2026, 4, 24)]
+        # Values pulled correctly.
+        assert df.iloc[1]["gex"] == 150.0
+        assert df.iloc[1]["underlying_price"] == 551.0
+        # gex_plus = gex + vex.
+        assert df.iloc[2]["gex_plus"] == 200.0 + (-80.0)
+        # Flip strikes round-trip as a list.
+        assert df.iloc[0]["gex_flip"] == [550.0]
+
+    def test_synthetic_archive_compatible(self, archived_result):
+        """A real archive_results() write is loadable via load_score_history."""
+        result, config = archived_result
+        df = load_score_history("SPY", config=config)
+        assert len(df) >= 1
+        assert "gex_flip" in df.columns
 
 
 if __name__ == "__main__":

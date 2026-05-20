@@ -1,0 +1,18 @@
+[Unit]
+Description=Greek Engine Scheduler (30-min market-hours auto-refresh)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/greek_engine
+Environment=DATABENTO_API_KEY=REPLACE_WITH_YOUR_DATABENTO_KEY
+Environment=ARCHIVE_ROOT=/root/greek_engine/archive
+ExecStart=/root/greek_engine/venv/bin/python /root/greek_engine/scheduler.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

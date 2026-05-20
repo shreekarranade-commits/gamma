@@ -14,7 +14,7 @@ from numpy.testing import assert_allclose
 from aggregation import (
     compute_sign, compute_exposures, compute_headline_scores,
     compute_strike_profiles, assign_expiry_bucket, compute_expiry_breakdown,
-    build_all_outputs,
+    build_all_outputs, find_flip_strikes, interpret_scores,
 )
 from config import PRODUCTS
 
@@ -276,6 +276,165 @@ class TestBuildAllOutputs:
         assert result["scores"]["gex"] == 0
         assert result["scores"]["vex"] == 0
         assert result["scores"]["cex"] == 0
+
+
+# ══════════════════════════════════════════════════════════════
+# 7. FLIP DETECTION (Enhancement 5, v1.3)
+# ══════════════════════════════════════════════════════════════
+
+class TestFlipDetection:
+
+    def test_no_flips_for_all_positive(self):
+        df = pd.DataFrame({"strike": [540.0, 545.0, 550.0], "gex": [10.0, 20.0, 30.0]})
+        assert find_flip_strikes(df, "gex") == []
+
+    def test_no_flips_for_all_negative(self):
+        df = pd.DataFrame({"strike": [540.0, 545.0, 550.0], "gex": [-10.0, -20.0, -30.0]})
+        assert find_flip_strikes(df, "gex") == []
+
+    def test_single_flip_midway(self):
+        """Equal magnitudes with opposite signs → flip exactly between strikes."""
+        df = pd.DataFrame({"strike": [540.0, 550.0], "gex": [-100.0, 100.0]})
+        flips = find_flip_strikes(df, "gex")
+        assert len(flips) == 1
+        assert abs(flips[0] - 545.0) < 1e-9
+
+    def test_single_flip_skewed(self):
+        """Linear interpolation produces correct fraction between strikes."""
+        df = pd.DataFrame({"strike": [540.0, 550.0], "gex": [-30.0, 70.0]})
+        flips = find_flip_strikes(df, "gex")
+        assert len(flips) == 1
+        # |-30| / (|-30|+|70|) = 0.3 → 540 + 0.3*10 = 543
+        assert abs(flips[0] - 543.0) < 1e-9
+
+    def test_multiple_flips(self):
+        """Multiple zero-crossings are all reported."""
+        df = pd.DataFrame({
+            "strike": [540.0, 545.0, 550.0, 555.0, 560.0],
+            "gex": [-50.0, 50.0, 50.0, -50.0, -50.0],
+        })
+        flips = find_flip_strikes(df, "gex")
+        assert len(flips) == 2
+        # First flip between 540/545 (50/50 → 542.5), second between 550/555 (50/50 → 552.5)
+        assert abs(flips[0] - 542.5) < 1e-9
+        assert abs(flips[1] - 552.5) < 1e-9
+
+    def test_unsorted_input_handled(self):
+        """Input in arbitrary strike order is sorted internally."""
+        df = pd.DataFrame({"strike": [550.0, 540.0], "gex": [100.0, -100.0]})
+        flips = find_flip_strikes(df, "gex")
+        assert len(flips) == 1
+        assert abs(flips[0] - 545.0) < 1e-9
+
+    def test_short_input_returns_empty(self):
+        df = pd.DataFrame({"strike": [550.0], "gex": [100.0]})
+        assert find_flip_strikes(df, "gex") == []
+
+    def test_missing_column_returns_empty(self):
+        df = pd.DataFrame({"strike": [540.0, 550.0], "gex": [-1.0, 1.0]})
+        assert find_flip_strikes(df, "vex") == []
+
+    def test_build_all_outputs_includes_flips(self, sample_contracts):
+        """build_all_outputs adds gex_flip / vex_flip / cex_flip to scores."""
+        product = PRODUCTS["SPY"]
+        result = build_all_outputs(sample_contracts, 550.0, product)
+        assert "gex_flip" in result["scores"]
+        assert "vex_flip" in result["scores"]
+        assert "cex_flip" in result["scores"]
+        # Each entry must be a list (possibly empty) of floats.
+        for key in ["gex_flip", "vex_flip", "cex_flip"]:
+            assert isinstance(result["scores"][key], list)
+            for v in result["scores"][key]:
+                assert isinstance(v, float)
+
+    def test_build_all_outputs_includes_min_dte(self, sample_contracts):
+        """min_dte is stored in scores so OPEX detection works from cache."""
+        product = PRODUCTS["SPY"]
+        result = build_all_outputs(sample_contracts, 550.0, product)
+        assert "min_dte" in result["scores"]
+        # sample_contracts has all dte=7
+        assert result["scores"]["min_dte"] == 7
+
+
+# ══════════════════════════════════════════════════════════════
+# 8. REGIME-AWARE INTERPRETATION
+# ══════════════════════════════════════════════════════════════
+
+class TestInterpretScores:
+
+    def test_stabilizing_regime(self):
+        out = interpret_scores({"gex": 1e8, "vex": 1e8, "cex": 0, "gex_plus": 2e8})
+        assert out["regime"] == "STABILIZING"
+        assert "Stabilizing" in out["gex"]
+        assert "dealer buying" in out["vex"]
+        assert "Strong liquidity" in out["gex_plus"]
+
+    def test_destabilized_regime(self):
+        out = interpret_scores({"gex": -1e8, "vex": -1e8, "cex": 0, "gex_plus": -2e8})
+        assert out["regime"] == "DESTABILIZED"
+        assert "Destabilized" in out["gex"]
+        assert "Crash-prone" in out["vex"]
+        assert "vacuum" in out["gex_plus"]
+
+    def test_fragile_stable_but_fragile(self):
+        """GEX > 0 with VEX < 0 → fragile regime."""
+        out = interpret_scores({"gex": 1e8, "vex": -1e8, "cex": 0, "gex_plus": 0})
+        assert out["regime"] == "FRAGILE"
+        assert "Stable but fragile" in out["gex"]
+        assert "Liquidity cliff" in out["vex"]
+
+    def test_fragile_weak(self):
+        """GEX < 0 with VEX > 0 → fragile but vanna-supportive."""
+        out = interpret_scores({"gex": -1e8, "vex": 1e8, "cex": 0, "gex_plus": 0})
+        assert out["regime"] == "FRAGILE"
+        assert "Weak" in out["gex"]
+        assert "cushion" in out["vex"]
+
+    def test_neutral_regime(self):
+        """Both GEX and VEX near zero compared to GEX+ → NEUTRAL."""
+        out = interpret_scores({"gex": 1e6, "vex": 1e6, "cex": 0, "gex_plus": 1e9})
+        assert out["regime"] == "NEUTRAL"
+        assert "Neutral" in out["gex"]
+
+    def test_cex_sellers(self):
+        out = interpret_scores({"gex": 1e8, "vex": 1e8, "cex": 5e8, "gex_plus": 2e8})
+        assert "Sellers tomorrow" in out["cex"]
+        # No OPEX prefix when min_dte is unset.
+        assert not out["cex"].startswith("OPEX:")
+
+    def test_cex_buyers(self):
+        out = interpret_scores({"gex": 1e8, "vex": 1e8, "cex": -5e8, "gex_plus": 2e8})
+        assert "Buyers tomorrow" in out["cex"]
+
+    def test_cex_minimal(self):
+        out = interpret_scores({"gex": 1e8, "vex": 1e8, "cex": 0, "gex_plus": 2e8})
+        assert "Minimal" in out["cex"]
+
+    def test_opex_prefix_when_min_dte_le_2(self):
+        """min_dte <= 2 prepends 'OPEX:' to the CEX subtitle."""
+        out = interpret_scores({
+            "gex": 1e8, "vex": 1e8, "cex": 5e8, "gex_plus": 2e8, "min_dte": 1,
+        })
+        assert out["cex"].startswith("OPEX:")
+        out2 = interpret_scores({
+            "gex": 1e8, "vex": 1e8, "cex": 5e8, "gex_plus": 2e8, "min_dte": 5,
+        })
+        assert not out2["cex"].startswith("OPEX:")
+
+    def test_gex_plus_mild_vs_strong(self):
+        # GEX+ small relative to GEX/VEX magnitudes → "Mild support"
+        mild = interpret_scores({"gex": 1e9, "vex": -8e8, "cex": 0, "gex_plus": 2e8})
+        assert "Mild support" in mild["gex_plus"]
+        # GEX+ dominates → "Strong liquidity"
+        strong = interpret_scores({"gex": 1e9, "vex": 1e9, "cex": 0, "gex_plus": 2e9})
+        assert "Strong liquidity" in strong["gex_plus"]
+
+    def test_handles_missing_keys(self):
+        """Empty scores dict doesn't raise."""
+        out = interpret_scores({})
+        assert out["regime"] == "NEUTRAL"
+        assert out["gex"]
+        assert out["cex"]
 
 
 if __name__ == "__main__":
