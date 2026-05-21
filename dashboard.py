@@ -5,10 +5,12 @@ Layer 1: Headline scores (GEX, VEX, CEX, GEX+)
 Layer 2: Strike-level bar charts per Greek
 Layer 3: Expiry-bucket stacked bars
 Layer 4: Combined overlay
+Layer 5 (v1.4): Positioning — OI+Volume calls vs puts for /GC and /CL
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
+from urllib.parse import parse_qs
 
 import dash
 from dash import dcc, html, Input, Output, State, callback
@@ -22,9 +24,10 @@ from archive import (
     list_archived_products, list_archived_dates,
     load_scores, load_strike_profiles, load_expiry_breakdown,
     load_metadata, get_archive_availability, load_score_history,
-    archive_results,
+    archive_results, load_positioning, list_positioning_dates,
 )
 from aggregation import interpret_scores
+from positioning import current_week_dates, sum_positioning_across_expiries
 
 REGIME_COLORS = {
     "STABILIZING":  "#26a69a",
@@ -329,6 +332,93 @@ def build_overlay_chart(
 
 
 # ══════════════════════════════════════════════════════════════
+# POSITIONING CHART (v1.4)
+# ══════════════════════════════════════════════════════════════
+
+POSITIONING_PRODUCT_OPTIONS = [
+    {"label": "/GC", "value": "GC"},
+    {"label": "/CL", "value": "CL"},
+]
+
+
+def _positioning_empty_figure(message: str) -> go.Figure:
+    """Empty figure with a centered message in the chart area."""
+    fig = go.Figure()
+    fig.update_layout(
+        paper_bgcolor=COLORS["bg"],
+        plot_bgcolor=COLORS["bg"],
+        font=dict(color=COLORS["text"], family="Arial, sans-serif"),
+        margin=dict(l=60, r=30, t=30, b=50),
+        height=500,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        annotations=[dict(
+            text=message, xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color=COLORS["text_dim"]),
+        )],
+    )
+    return fig
+
+
+def build_positioning_chart(df_sum: pd.DataFrame) -> go.Figure:
+    """
+    Single Plotly line chart, two traces (Calls green, Puts red).
+    Per the v1.4 spec: no subplots, no fills, no markers (unless a single
+    point), no zero line, no annotations, standard hover, standard legend.
+    """
+    if df_sum is None or df_sum.empty:
+        return _positioning_empty_figure("No data for selected expiries")
+
+    mode = "markers" if len(df_sum) == 1 else "lines"
+    x = df_sum["snapshot_time"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=df_sum["calls"], name="Calls", mode=mode,
+        line=dict(color="#26a69a", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=df_sum["puts"], name="Puts", mode=mode,
+        line=dict(color="#ef5350", width=2),
+    ))
+
+    fig.update_layout(
+        paper_bgcolor=COLORS["bg"],
+        plot_bgcolor=COLORS["bg"],
+        font=dict(color=COLORS["text"], family="Arial, sans-serif"),
+        margin=dict(l=60, r=30, t=30, b=50),
+        hovermode="x unified",
+        height=500,
+        showlegend=True,
+        xaxis=dict(
+            gridcolor=COLORS["grid"], zerolinecolor=COLORS["grid"],
+            tickformat="%H:%M", type="category",
+        ),
+        yaxis=dict(
+            gridcolor=COLORS["grid"], rangemode="tozero",
+            title="OI + Volume",
+        ),
+    )
+    return fig
+
+
+def _format_week_label(monday: date) -> str:
+    return f"Week of Mon {monday.isoformat()}"
+
+
+def _weeks_from_dates(dates: list[date], show_all: bool) -> list[date]:
+    """Distinct Mondays of weeks containing any archived date."""
+    if not dates:
+        return []
+    mondays = sorted({d - timedelta(days=d.weekday()) for d in dates}, reverse=True)
+    if show_all:
+        return mondays
+    # Default: only the current week (Mon-Fri block of latest archived date)
+    return mondays[:1]
+
+
+# ══════════════════════════════════════════════════════════════
 # APP LAYOUT
 # ══════════════════════════════════════════════════════════════
 
@@ -350,6 +440,9 @@ def create_app() -> dash.Dash:
     app = dash.Dash(__name__, **dash_kwargs)
 
     app.layout = dbc.Container([
+        # ── URL for deep-linking (?tab=positioning&date=YYYY-MM-DD) ──
+        dcc.Location(id="url", refresh=False),
+
         # ── Header ──
         dbc.Row([
             dbc.Col([
@@ -467,6 +560,57 @@ def create_app() -> dash.Dash:
                 dbc.Row([
                     dbc.Col(dcc.Graph(id="timeseries-flips"), width=12),
                 ]),
+            ]),
+            dbc.Tab(label="Positioning", tab_id="tab-positioning", children=[
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Product", style={"fontSize": "12px", "color": COLORS["text_dim"]}),
+                        dcc.RadioItems(
+                            id="pos-product",
+                            options=POSITIONING_PRODUCT_OPTIONS,
+                            value="GC",
+                            inline=True,
+                            inputStyle={"marginRight": "6px"},
+                            labelStyle={"marginRight": "16px", "color": COLORS["text"]},
+                        ),
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("Show all history", style={"fontSize": "12px", "color": COLORS["text_dim"]}),
+                        dbc.Switch(id="pos-show-all", value=False, style={"marginTop": "4px"}),
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("Week", style={"fontSize": "12px", "color": COLORS["text_dim"]}),
+                        dcc.Dropdown(
+                            id="pos-week", options=[], value=None, clearable=False,
+                            style={"backgroundColor": COLORS["card"]},
+                        ),
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("Trading date", style={"fontSize": "12px", "color": COLORS["text_dim"]}),
+                        dcc.Dropdown(
+                            id="pos-date", options=[], value=None, clearable=False,
+                            style={"backgroundColor": COLORS["card"]},
+                        ),
+                    ], width=2),
+                    dbc.Col([
+                        html.Label("Expiries", style={"fontSize": "12px", "color": COLORS["text_dim"]}),
+                        dcc.Dropdown(
+                            id="pos-expiries", options=[], value=[], multi=True,
+                            style={"backgroundColor": COLORS["card"]},
+                        ),
+                    ], width=3),
+                    dbc.Col([
+                        html.Label(" ", style={"fontSize": "12px"}),
+                        dbc.Button(
+                            "Select all", id="pos-select-all", color="secondary",
+                            size="sm", style={"width": "100%", "marginTop": "4px"},
+                        ),
+                    ], width=1),
+                ], className="mt-3"),
+                dbc.Row([
+                    dbc.Col(dcc.Graph(id="positioning-chart"), width=12),
+                ]),
+                dcc.Store(id="pos-url-date"),
             ]),
         ], id="view-tabs", active_tab="tab-profiles",
            style={"marginBottom": "20px"}),
@@ -913,6 +1057,165 @@ def create_app() -> dash.Dash:
         )
 
         return fig, flips_fig
+
+    # ══════════════════════════════════════════════════════════
+    # POSITIONING TAB CALLBACKS (v1.4)
+    # ══════════════════════════════════════════════════════════
+
+    @app.callback(
+        Output("view-tabs", "active_tab"),
+        Output("pos-url-date", "data"),
+        Input("url", "search"),
+    )
+    def parse_url(search):
+        """
+        Read ?tab=positioning&date=YYYY-MM-DD on initial load.
+        URL date is a one-shot hint; user clicks afterwards take over.
+        """
+        if not search:
+            return dash.no_update, None
+        qs = parse_qs(search.lstrip("?"))
+        active = dash.no_update
+        if qs.get("tab", [None])[0] == "positioning":
+            active = "tab-positioning"
+        url_date = None
+        d = qs.get("date", [None])[0]
+        if d:
+            try:
+                url_date = date.fromisoformat(d).isoformat()
+            except ValueError:
+                url_date = None
+        return active, url_date
+
+    @app.callback(
+        Output("pos-week", "options"),
+        Output("pos-week", "value"),
+        Input("pos-product", "value"),
+        Input("pos-show-all", "value"),
+        State("pos-url-date", "data"),
+    )
+    def update_pos_weeks(product, show_all, url_date):
+        if not product:
+            return [], None
+        dates = list_positioning_dates(product)
+        if not dates:
+            return [], None
+        mondays = _weeks_from_dates(dates, bool(show_all))
+        options = [{"label": _format_week_label(m), "value": m.isoformat()} for m in mondays]
+
+        chosen = mondays[0].isoformat() if mondays else None
+        if url_date:
+            try:
+                d = date.fromisoformat(url_date)
+                if d in dates:
+                    monday = (d - timedelta(days=d.weekday())).isoformat()
+                    if any(opt["value"] == monday for opt in options):
+                        chosen = monday
+            except ValueError:
+                pass
+        return options, chosen
+
+    @app.callback(
+        Output("pos-date", "options"),
+        Output("pos-date", "value"),
+        Input("pos-product", "value"),
+        Input("pos-week", "value"),
+        State("pos-url-date", "data"),
+    )
+    def update_pos_dates(product, week, url_date):
+        if not product or not week:
+            return [], None
+        try:
+            monday = date.fromisoformat(week)
+        except ValueError:
+            return [], None
+        archived = set(list_positioning_dates(product))
+        week_days = [monday + timedelta(days=i) for i in range(5)]
+        options = []
+        for d in week_days:
+            has_data = d in archived
+            options.append({
+                "label": f"{d.strftime('%a')} {d.isoformat()}" + ("" if has_data else "  (no data)"),
+                "value": d.isoformat(),
+                "disabled": not has_data,
+            })
+        in_week = [d for d in week_days if d in archived]
+        chosen = in_week[-1].isoformat() if in_week else None
+        if url_date:
+            try:
+                d = date.fromisoformat(url_date)
+                if d in archived and monday <= d < monday + timedelta(days=7):
+                    chosen = d.isoformat()
+            except ValueError:
+                pass
+        return options, chosen
+
+    @app.callback(
+        Output("pos-expiries", "options"),
+        Output("pos-expiries", "value"),
+        Input("pos-product", "value"),
+        Input("pos-date", "value"),
+    )
+    def update_pos_expiries(product, date_str):
+        if not product or not date_str:
+            return [], []
+        try:
+            snapshot_date = date.fromisoformat(date_str)
+        except ValueError:
+            return [], []
+        df = load_positioning(product, snapshot_date)
+        if df.empty:
+            return [], []
+        expiries = sorted({pd.Timestamp(d).date() for d in df["expiry"]})
+        options = [
+            {"label": f"{e.strftime('%a')} {e.isoformat()}", "value": e.isoformat()}
+            for e in expiries
+        ]
+        # Default: nearest expiry on or after the trading date (else the earliest).
+        forward = [e for e in expiries if e >= snapshot_date]
+        nearest = forward[0] if forward else expiries[0]
+        return options, [nearest.isoformat()]
+
+    @app.callback(
+        Output("pos-expiries", "value", allow_duplicate=True),
+        Input("pos-select-all", "n_clicks"),
+        State("pos-expiries", "options"),
+        prevent_initial_call=True,
+    )
+    def pos_select_all(n_clicks, options):
+        if not n_clicks or not options:
+            return dash.no_update
+        return [opt["value"] for opt in options if not opt.get("disabled")]
+
+    @app.callback(
+        Output("positioning-chart", "figure"),
+        Input("pos-product", "value"),
+        Input("pos-date", "value"),
+        Input("pos-expiries", "value"),
+    )
+    def update_pos_chart(product, date_str, selected):
+        if not product or not date_str:
+            return _positioning_empty_figure("No positioning data available for this date")
+        try:
+            snapshot_date = date.fromisoformat(date_str)
+        except ValueError:
+            return _positioning_empty_figure("No positioning data available for this date")
+
+        df = load_positioning(product, snapshot_date)
+        if df.empty:
+            return _positioning_empty_figure("No positioning data available for this date")
+        if not selected:
+            return _positioning_empty_figure("Select at least one expiry")
+
+        try:
+            selected_dates = [date.fromisoformat(s) for s in selected]
+        except (TypeError, ValueError):
+            return _positioning_empty_figure("Select at least one expiry")
+
+        df_sum = sum_positioning_across_expiries(df, selected_dates)
+        if df_sum.empty:
+            return _positioning_empty_figure("No data for selected expiries")
+        return build_positioning_chart(df_sum)
 
     @app.callback(
         Output("metadata-footer", "children"),

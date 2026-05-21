@@ -3,11 +3,12 @@
 Greek Exposure Engine - CLI Entry Point
 
 Commands:
-  run       Run pipeline for a product (live Databento data)
-  synthetic Run pipeline with synthetic data (no API key needed)
-  purge     Purge archived data
-  serve     Start the dashboard web server
-  validate  Run reference case validation
+  run         Run pipeline for a product (live Databento data)
+  synthetic   Run pipeline with synthetic data (no API key needed)
+  purge       Purge archived data
+  serve       Start the dashboard web server
+  validate    Run reference case validation
+  positioning Snapshot OI+Volume positioning for /GC and/or /CL
 """
 
 import sys
@@ -185,6 +186,58 @@ def cmd_validate(args):
     sys.exit(0 if success else 1)
 
 
+def cmd_positioning(args):
+    """Manual positioning snapshot for /GC and/or /CL."""
+    import os
+    if args.api_key:
+        os.environ["DATABENTO_API_KEY"] = args.api_key
+
+    from pipeline import ingest_chain, build_chain_dataframe, POSITIONING_PRODUCTS
+    from positioning import compute_positioning_all_expiries, current_snapshot_time_et
+    from archive import archive_positioning
+
+    raw_arg = args.product.strip()
+    if raw_arg.lower() == "all":
+        symbols = list(POSITIONING_PRODUCTS)
+    else:
+        sym = raw_arg.lstrip("/").upper()
+        if sym not in POSITIONING_PRODUCTS:
+            raise SystemExit(
+                f"positioning supports {POSITIONING_PRODUCTS} or 'all' — got {args.product!r}"
+            )
+        symbols = [sym]
+
+    snapshot_date = date.fromisoformat(args.date) if args.date else date.today()
+
+    for sym in symbols:
+        product = PRODUCTS[sym]
+        try:
+            raw = ingest_chain(product, snapshot_date, snapshot_time=args.time)
+            effective_date = raw.get("effective_date", snapshot_date)
+            chain = build_chain_dataframe(raw, product)
+            results = compute_positioning_all_expiries(chain)
+            if not results:
+                print(f"  /{sym}: no expiries returned from chain")
+                continue
+            record = {
+                "snapshot_date": effective_date,
+                "snapshot_time": current_snapshot_time_et(),
+                "product": sym,
+                "expiries": {
+                    e: (r.calls_total, r.puts_total, r.net) for e, r in results.items()
+                },
+            }
+            path = archive_positioning(record)
+            print(f"  /{sym}: archived {len(results)} expiries → {path}")
+            for expiry, r in sorted(results.items()):
+                print(
+                    f"    {expiry}  calls={r.calls_total:>12,.0f}  "
+                    f"puts={r.puts_total:>12,.0f}  net={r.net:>+13,.0f}"
+                )
+        except Exception as e:
+            print(f"  /{sym}: FAILED — {type(e).__name__}: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Greek Exposure Engine",
@@ -248,6 +301,13 @@ def main():
     # ── validate ──
     sub.add_parser("validate", help="Run reference case validation")
 
+    # ── positioning ──
+    p_pos = sub.add_parser("positioning", help="Snapshot OI+Volume positioning for /GC and/or /CL")
+    p_pos.add_argument("product", help="/GC, /CL, GC, CL, or 'all'")
+    p_pos.add_argument("--date", help="Snapshot date YYYY-MM-DD (default: today)")
+    p_pos.add_argument("--time", default="15:55", help="Snapshot time HH:MM (default: 15:55)")
+    p_pos.add_argument("--api-key", help="Databento API key (or set DATABENTO_API_KEY)")
+
     args = parser.parse_args()
 
     # Setup logging
@@ -266,6 +326,7 @@ def main():
         "purge": cmd_purge,
         "serve": cmd_serve,
         "validate": cmd_validate,
+        "positioning": cmd_positioning,
     }
 
     commands[args.command](args)
