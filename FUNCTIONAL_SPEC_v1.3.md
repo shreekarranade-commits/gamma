@@ -696,7 +696,125 @@ Run phases sequentially, monitoring API usage between each. Phase 1 alone provid
 
 ---
 
-## 22. Revision History
+## 22. Positioning View (v1.4)
+
+A simplified, non-Greeks intraday signal for futures-options products
+(/GC and /CL). Bypasses the IV solve, BSM/Black-76 evaluation, and per-
+contract Greek computation that drive the rest of the engine.
+
+### 22.1 Metric
+
+For a selected product and expiry date, each 30-minute snapshot produces
+three values summed across every strike with non-zero OI or volume:
+
+```
+calls_total(t, expiry) = Σ_strikes (call_OI + call_Vol)
+puts_total(t, expiry)  = Σ_strikes (put_OI + put_Vol)
+net(t, expiry)         = calls_total − puts_total
+```
+
+`calls_total` and `puts_total` are always ≥ 0. `net` is signed and stored
+alongside them so the dashboard renders without recomputation and future
+queries (overlays, alerting) need no arithmetic.
+
+No moneyness filter is applied — the full chain is summed. OI + Volume
+drift is expected (volume accumulates monotonically during the session);
+the metric is intentionally not normalized or detrended.
+
+### 22.2 Pipeline Integration
+
+Positioning is computed inside `run_pipeline()` for /GC and /CL only,
+immediately after `build_chain_dataframe()` and before any filtering or
+IV solve. SPY/QQQ/TSLA skip the path silently. Each scheduler tick (30
+minutes during market hours) emits one record per /GC and /CL with all
+of that week's daily expiries.
+
+### 22.3 Archive Schema
+
+Per-trading-day Parquet files independent of the Greeks two-tier archive:
+
+```
+archive/positioning/{GC|CL}/{snapshot_date}/positioning.parquet
+```
+
+Columns:
+
+| Column | Type | Notes |
+|---|---|---|
+| snapshot_date | date | Trading day |
+| snapshot_time | string | HH:MM:SS in US/Eastern, seconds zeroed |
+| product | string | "/GC" or "/CL" |
+| expiry | date | One of the week's daily expiries |
+| calls_total | float64 | Σ (call_OI + call_Vol) |
+| puts_total | float64 | Σ (put_OI + put_Vol) |
+| net | float64 | calls_total − puts_total |
+
+Each tick appends rows. Last-write-wins on duplicate `(snapshot_time,
+expiry)` keys — manual CLI overlap with the scheduler is handled by
+dedupe on read and write.
+
+### 22.4 Dashboard Tab
+
+A "Positioning" tab in the main Dash view-tabs row. Controls:
+
+- Product radio (/GC, /CL — default /GC)
+- "Show all history" switch (default off → current week only)
+- Trading-week dropdown (Mon–Fri label)
+- Trading-date dropdown (5 weekdays of the chosen week; days without
+  archived data shown but disabled)
+- Multi-select expiry dropdown (populated dynamically from the day's
+  archive; default selects the nearest expiry)
+- "Select all" button (selects every enabled expiry)
+
+The chart is a single Plotly line chart with two traces — Calls
+(`#26a69a`) and Puts (`#ef5350`). X-axis is `snapshot_time` formatted as
+HH:MM; Y-axis is "OI + Volume" anchored at 0. No fills, no markers
+(unless only one snapshot point exists), no zero line, no subplots, no
+sign-conditional coloring. The vertical gap between the two lines is the
+net positioning across the selected expiries.
+
+URL deep-linking: `?tab=positioning` lands on the Positioning tab,
+`?tab=positioning&date=YYYY-MM-DD` additionally prefills that trading
+date when archived. The tab always defaults to "now" (current week,
+most recent date, nearest expiry) on fresh loads; no per-user state is
+persisted.
+
+### 22.5 Retention Policy
+
+**Positioning archives are kept indefinitely.** No automatic purge, no
+cold-storage tier, no compaction.
+
+Rationale:
+- Historical OI + Volume from expired weeks is the project's most
+  valuable asset for backtesting and pattern recognition.
+- Storage growth is negligible — ~50 KB/day × 2 products × 252 days/yr
+  ≈ 25 MB/year.
+- The per-day folder layout makes manual pruning trivial:
+  `rm -rf archive/positioning/{product}/{date}/`. No code required.
+
+Three "expired" scenarios and how each is handled:
+
+| Scenario | Handling |
+|---|---|
+| Option expiry dates that have settled | Archived rows stay; the expiry is just a column value. |
+| Past trading days | Archived normally; visible via "Show all history". |
+| Disk pressure (hypothetical) | Manual `rm -rf`. No automated process. |
+
+### 22.6 CLI
+
+```bash
+python engine.py positioning /GC
+python engine.py positioning /GC --date 2026-05-15
+python engine.py positioning all
+```
+
+Useful for backfills and manual testing without waiting for the
+scheduler. Manual runs share the same dedupe semantics as scheduler
+runs.
+
+---
+
+## 23. Revision History
 
 | Version | Date | Changes |
 |---------|------|---------|
@@ -704,7 +822,8 @@ Run phases sequentially, monitoring API usage between each. Phase 1 alone provid
 | 1.1 | April 23, 2026 | Major revision: theoretical foundations, product config schema, expanded math framework, numerical validation, 3D surface reserved feature, build prerequisites, future enhancements. |
 | 1.2 | April 23, 2026 | Added Data Lifecycle Management (Section 9): two-tier archive, Parquet storage, retention policies, purge processes, replay capability. Added archive step to pipeline. |
 | 1.3 | April 25, 2026 | Added: 30-minute automated scheduling during market hours (Section 15). Put-call parity spot inference in main pipeline (Section 15.2). Multi-product run command (Section 15.3). Volume data capture alongside OI (Section 16). Flip line detection and visualization for gamma, vanna, and charm zero-crossings (Section 17). Dashboard date comparison mode (Section 18.1). Historical time series tab (Section 18.2). Live refresh button enhancement (Section 18.3). Regime-aware score card interpretation with cross-score context and overall regime banner (Section 18.4). Historical backfill capability with CLI interface and phased rollout strategy (Section 19). Renumbered Sections 20–22. |
+| 1.4 | May 16, 2026 | Added Positioning view (Section 22): non-Greeks intraday OI+Volume signal for /GC and /CL, separate per-day Parquet archive kept indefinitely, dedicated dashboard tab with current-week default and "Show all history" toggle, `positioning` CLI subcommand. Renumbered Revision History to Section 23. |
 
 ---
 
-*End of Functional Specification — Living Document — v1.3*
+*End of Functional Specification — Living Document — v1.4*

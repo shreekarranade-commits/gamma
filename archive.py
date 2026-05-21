@@ -4,13 +4,17 @@ Data lifecycle management: archive, purge, replay.
 Two-tier storage:
   Tier 1: Raw chain (Parquet) - full replay capability
   Tier 2: Computed results (Parquet + JSON) - fast retrieval
+
+Positioning archive (v1.4): separate per-day intraday Parquet under
+  archive/positioning/{product}/{date}/positioning.parquet
+Independent of the two-tier Greeks archive — kept indefinitely.
 """
 
 import json
 import shutil
 import logging
 from pathlib import Path
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pandas as pd
 
@@ -385,3 +389,151 @@ def _update_manifest(config: ArchiveConfig = ARCHIVE_DEFAULTS):
 
     with open(root / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
+
+
+# ══════════════════════════════════════════════════════════════
+# POSITIONING ARCHIVE (v1.4)
+# ══════════════════════════════════════════════════════════════
+
+POSITIONING_SUBDIR = "positioning"
+POSITIONING_COLUMNS = [
+    "snapshot_date", "snapshot_time", "product",
+    "expiry", "calls_total", "puts_total", "net",
+]
+
+
+def _product_slug(product: str) -> str:
+    """Strip the optional display slash: '/GC' → 'GC'."""
+    return product.lstrip("/")
+
+
+def get_positioning_path(
+    product: str, snapshot_date: date, config: ArchiveConfig = ARCHIVE_DEFAULTS
+) -> Path:
+    """Path to a single trading day's positioning parquet."""
+    return (
+        Path(config.root_dir) / POSITIONING_SUBDIR
+        / _product_slug(product) / snapshot_date.isoformat()
+        / "positioning.parquet"
+    )
+
+
+def archive_positioning(
+    record: dict, config: ArchiveConfig = ARCHIVE_DEFAULTS
+) -> Path:
+    """
+    Append per-expiry positioning rows to the trading day's parquet.
+
+    record keys:
+      snapshot_date : date
+      snapshot_time : time   — wall-clock ET, seconds zeroed
+      product       : str    — "GC", "/GC", "CL", "/CL"
+      expiries      : dict[date, tuple(calls_total, puts_total, net)]
+
+    Last-write-wins on (snapshot_time, expiry) duplicates — manual CLI
+    + scheduler overlaps can produce duplicate ticks; the latest write
+    is kept and earlier rows for the same key dropped on read and write.
+    """
+    product_in = record["product"]
+    slug = _product_slug(product_in)
+    display = product_in if product_in.startswith("/") else f"/{product_in}"
+    snapshot_date = record["snapshot_date"]
+    snapshot_time = record["snapshot_time"]
+    expiries = record.get("expiries") or {}
+
+    path = get_positioning_path(slug, snapshot_date, config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(snapshot_time, time):
+        snapshot_time_str = snapshot_time.isoformat(timespec="seconds")
+    else:
+        snapshot_time_str = str(snapshot_time)
+
+    rows = []
+    for expiry, totals in expiries.items():
+        calls_total, puts_total, net = float(totals[0]), float(totals[1]), float(totals[2])
+        rows.append({
+            "snapshot_date": snapshot_date,
+            "snapshot_time": snapshot_time_str,
+            "product": display,
+            "expiry": expiry,
+            "calls_total": calls_total,
+            "puts_total": puts_total,
+            "net": net,
+        })
+
+    if not rows:
+        logger.info(f"  Positioning: no expiries to archive for {display} on {snapshot_date}")
+        return path
+
+    new_df = pd.DataFrame(rows, columns=POSITIONING_COLUMNS)
+
+    if path.exists():
+        try:
+            existing = pd.read_parquet(path)
+            combined = pd.concat([existing, new_df], ignore_index=True)
+        except Exception as e:
+            logger.warning(f"  Positioning: existing archive unreadable ({e}); overwriting")
+            combined = new_df
+    else:
+        combined = new_df
+
+    combined["expiry"] = pd.to_datetime(combined["expiry"]).dt.date
+    combined = combined.drop_duplicates(
+        subset=["snapshot_time", "expiry"], keep="last"
+    ).reset_index(drop=True)
+    combined = combined.sort_values(["snapshot_time", "expiry"]).reset_index(drop=True)
+
+    combined.to_parquet(path, index=False)
+    logger.info(
+        f"  Positioning archived: {path} "
+        f"({len(new_df)} new rows, {len(combined)} total in file)"
+    )
+    return path
+
+
+def load_positioning(
+    product: str, snapshot_date: date, config: ArchiveConfig = ARCHIVE_DEFAULTS
+) -> pd.DataFrame:
+    """
+    Load all intraday positioning snapshots for a single trading day.
+
+    Returns DataFrame with columns:
+        snapshot_time, expiry, calls_total, puts_total, net.
+    Empty DataFrame with those columns if no archive exists.
+
+    Duplicates on (snapshot_time, expiry) are deduplicated on read,
+    keeping the latest entry (defensive — writes already dedupe).
+    """
+    cols = ["snapshot_time", "expiry", "calls_total", "puts_total", "net"]
+    path = get_positioning_path(product, snapshot_date, config)
+    if not path.exists():
+        return pd.DataFrame(columns=cols)
+
+    df = pd.read_parquet(path)
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+    df = df.drop_duplicates(
+        subset=["snapshot_time", "expiry"], keep="last"
+    ).reset_index(drop=True)
+    df = df.sort_values(["snapshot_time", "expiry"]).reset_index(drop=True)
+    return df[cols].copy()
+
+
+def list_positioning_dates(
+    product: str, config: ArchiveConfig = ARCHIVE_DEFAULTS
+) -> list[date]:
+    """List archived positioning dates for a product, ascending."""
+    base = Path(config.root_dir) / POSITIONING_SUBDIR / _product_slug(product)
+    if not base.exists():
+        return []
+    out = []
+    for sub in base.iterdir():
+        if sub.is_dir() and (sub / "positioning.parquet").exists():
+            try:
+                out.append(date.fromisoformat(sub.name))
+            except ValueError:
+                continue
+    return sorted(out)

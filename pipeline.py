@@ -20,12 +20,56 @@ except ImportError:
 
 from config import (
     ProductConfig, PRODUCTS, FilterConfig, FILTER_DEFAULTS,
-    PricingModel, get_databento_key,
+    PricingModel, ArchiveConfig, ARCHIVE_DEFAULTS, get_databento_key,
 )
 from models import compute_greeks, solve_iv
 from aggregation import build_all_outputs
+from positioning import compute_positioning_all_expiries, current_snapshot_time_et
 
 logger = logging.getLogger(__name__)
+
+
+# Products eligible for the v1.4 positioning archive. Equities (SPY,
+# QQQ, TSLA) are explicitly out of scope — futures-options only.
+POSITIONING_PRODUCTS = ("GC", "CL")
+
+
+def maybe_archive_positioning(
+    chain: pd.DataFrame,
+    product: ProductConfig,
+    snapshot_date: date,
+    snapshot_time_value=None,
+    config: ArchiveConfig = ARCHIVE_DEFAULTS,
+):
+    """
+    Compute and archive per-expiry positioning for /GC and /CL only.
+
+    Returns the archive path, or None if the product is not eligible
+    (SPY/QQQ/TSLA skip silently).
+
+    Failures are logged but never re-raised — positioning is a side
+    channel and must not break the main Greeks pipeline.
+    """
+    if product.symbol not in POSITIONING_PRODUCTS:
+        return None
+    try:
+        from archive import archive_positioning
+        results = compute_positioning_all_expiries(chain)
+        if not results:
+            logger.info(f"  Positioning: no expiries for {product.symbol}")
+            return None
+        record = {
+            "snapshot_date": snapshot_date,
+            "snapshot_time": snapshot_time_value or current_snapshot_time_et(),
+            "product": product.symbol,
+            "expiries": {
+                e: (r.calls_total, r.puts_total, r.net) for e, r in results.items()
+            },
+        }
+        return archive_positioning(record, config=config)
+    except Exception as e:
+        logger.error(f"  positioning archive failed for {product.symbol}: {type(e).__name__}: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -657,7 +701,12 @@ def run_pipeline(
     # 3. Build chain
     chain = build_chain_dataframe(raw, product)
 
-    # 3b. Infer underlying price if not provided
+    # 3b. Positioning archive (v1.4) — futures-options only, before any
+    # moneyness/OI filtering. Independent of the Greeks pipeline and
+    # silently skipped for SPY/QQQ/TSLA.
+    maybe_archive_positioning(chain, product, snapshot_date)
+
+    # 3c. Infer underlying price if not provided
     if underlying_price is None:
         underlying_price = infer_underlying_price(
             chain, snapshot_date, product, risk_free_rate
